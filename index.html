@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Audio-Reactive Nature Visuals — Boosted (Fix)</title>
+  <style>
+    :root { --bg:#0b0c10; --fg:#e6eef7; }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif}
+    #hud{position:fixed;left:12px;right:12px;bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:rgba(0,0,0,.45);backdrop-filter:blur(8px);padding:10px 12px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);z-index:10;transition:transform .25s ease,opacity .25s ease}
+    #hud.hidden{transform:translateY(20px);opacity:0;pointer-events:none}
+    #hud .group{display:flex;gap:8px;align-items:center}
+    #hud label{font-size:12px;opacity:.9}
+    #hud input[type="range"]{width:120px}
+    #hud button,#hud select{appearance:none;border:1px solid rgba(255,255,255,.15);background:#111418;color:var(--fg);padding:8px 10px;border-radius:10px;cursor:pointer}
+    #hud button:hover{border-color:rgba(255,255,255,.35)}
+    #fps{font-variant-numeric:tabular-nums;opacity:.6;font-size:12px}
+    #toggleHUD{position:fixed;top:12px;right:12px;z-index:11;appearance:none;border:1px solid rgba(255,255,255,.15);background:#111418;color:var(--fg);padding:8px 10px;border-radius:10px;cursor:pointer}
+    #toggleHUD:hover{border-color:rgba(255,255,255,.35)}
+    canvas{display:block;position:fixed;inset:0}
+    #error{position:fixed;left:12px;top:12px;right:12px;background:rgba(255,0,0,.08);border:1px solid rgba(255,0,0,.3);padding:8px 10px;border-radius:10px;display:none;z-index:12;font-size:12px}
+  </style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+  <button id="toggleHUD">⚙️ パネル非表示</button>
+  <div id="hud">
+    <div class="group"><button id="micBtn">🎤 マイク開始</button></div>
+    <div class="group"><label>感度<input id="sens" type="range" min="0.08" max="0.8" value="0.18" step="0.01"></label></div>
+    <div class="group"><label>スムージング<input id="smooth" type="range" min="0" max="0.95" value="0.6" step="0.01"></label></div>
+    <div class="group"><label>FFT<input id="fft" type="range" min="512" max="4096" value="2048" step="512"></label></div>
+
+    <div class="group"><label>映像<select id="videoSel"></select></label></div>
+    <div class="group"><label>モーション<select id="motionSel"></select></label></div>
+
+    <div class="group"><label><input id="auto" type="checkbox" checked> ビートで自動切替（映像）</label></div>
+    <div class="group"><label><input id="kickOnly" type="checkbox" checked> キック優先</label></div>
+
+    <!-- 反応強度（全体倍率） -->
+    <div class="group"><label>反応強度<input id="reactAmt" type="range" min="0.5" max="2.5" value="1.6" step="0.05"></label></div>
+
+    <!-- 詳細強度 -->
+    <div class="group"><label>歪み強度<input id="distAmt" type="range" min="0" max="2" value="1.2" step="0.01"></label></div>
+    <div class="group"><label>色相変化<input id="hueAmt"  type="range" min="0" max="2" value="1.4" step="0.01"></label></div>
+    <div class="group"><label>彩度反応<input id="satAmt"  type="range" min="0" max="2" value="1.2" step="0.01"></label></div>
+    <div class="group"><label>輝度反応<input id="valAmt"  type="range" min="0" max="2" value="1.0" step="0.01"></label></div>
+    <div class="group"><label>グロウ量<input id="bloomAmt"type="range" min="0" max="2" value="1.2" step="0.01"></label></div>
+
+    <div class="group"><button id="addUrl">URL追加</button><input id="filePick" type="file" accept="video/*" style="display:none"><button id="addFile">ローカル追加</button></div>
+    <div class="group"><span id="fps">FPS: --</span></div>
+  </div>
+  <div id="error"></div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+const showErr = (msg)=>{ const el=document.getElementById('error'); el.textContent=msg; el.style.display='block'; console.error(msg); };
+
+const dpr = Math.min(2, window.devicePixelRatio||1);
+const canvas = document.getElementById('cv');
+let renderer;
+try{
+  renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:false});
+}catch(e){
+  showErr('WebGL初期化に失敗しました: '+e.message);
+}
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+if (renderer){ renderer.setPixelRatio(dpr); }
+function resize(){ if(renderer) renderer.setSize(innerWidth, innerHeight, false);} resize(); addEventListener('resize', resize);
+
+// ====== Shader ======
+const vertexShader = `
+  varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position,1.0); }
+`;
+const fragmentShader = `
+  precision highp float; varying vec2 vUv;
+  uniform sampler2D tex0; uniform sampler2D tex1;
+  uniform float uMix; uniform float uTime; uniform vec2 uRes;
+  uniform float uLow; uniform float uMid; uniform float uHigh; uniform float uVol;
+  uniform int uMotion; uniform float uDistAmt,uHueAmt,uSatAmt,uValAmt,uBloomAmt,uReact; uniform float uBeat;
+  float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453123); }
+  float noise(vec2 p){ vec2 i=floor(p); vec2 f=fract(p); float a=hash(i), b=hash(i+vec2(1.,0.)), c=hash(i+vec2(0.,1.)), d=hash(i+vec2(1.,1.)); vec2 u=f*f*(3.-2.*f); return mix(a,b,u.x)+(c-a)*u.y*(1.-u.x)+(d-b)*u.x*u.y; }
+  vec3 rgb2hsv(vec3 c){ vec4 K=vec4(0.,-1./3.,2./3.,-1.); vec4 p=mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b,c.g)); vec4 q=mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x,c.r)); float d=q.x-min(q.w, q.y); float e=1e-10; return vec3(abs(q.z+(q.w-q.y)/(6.*d+e)), d/(q.x+e), q.x); }
+  vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.,2./3.,1./3.,3.); vec3 p=abs(fract(c.xxx+K.xyz)*6.-K.www); return c.z*mix(K.xxx, clamp(p-K.xxx,0.,1.), c.y); }
+  vec4 sampleTex(sampler2D t, vec2 uv){ return texture2D(t, uv); }
+  void main(){
+    vec2 uv=vUv; float aspect=uRes.x/uRes.y;
+    float shake=(uBeat*0.015 + uLow*0.0006) * uReact; uv += vec2(sin(uTime*18.0), cos(uTime*14.0))*shake;
+    float R=max(0.5,uReact);
+    if(uMotion==0){ vec2 p=uv*vec2(aspect,1.0); vec2 c=vec2(0.5*aspect,0.5); float r=length(p-c); float dist=sin(12.0*r - uTime*5.0)*(0.006+0.05*uLow*R)*uDistAmt; uv += dist*normalize(p-c); }
+    else if(uMotion==1){ uv += (noise(uv*10.0+uTime*0.8)-0.5)*0.06*(0.25+uMid*0.02*R)*uDistAmt; }
+    else if(uMotion==2){ uv.y += sin(uv.x*16.0+uTime*3.0)*0.03*(0.3+uLow*0.02*R)*uDistAmt; }
+    else if(uMotion==3){ uv += (noise(uv*6.0+uTime)-0.5)*0.035*(0.25+uHigh*0.02*R)*uDistAmt; }
+    else if(uMotion==4){ uv += (noise(uv*20.0+uTime*1.0)-0.5)*0.035*(0.3+uMid*0.02*R)*uDistAmt; }
+    else if(uMotion==5){ uv += vec2(0.0, sin(uv.x*24.0+uTime*4.0))*0.02*(0.3+uHigh*0.025*R)*uDistAmt; }
+    else if(uMotion==6){ uv += (noise(uv*36.0+uTime*2.0)-0.5)*0.02*(0.3+uLow*0.03*R)*uDistAmt; }
+    else if(uMotion==7){ uv += vec2(sin(uv.y*18.0+uTime*2.5), cos(uv.x*18.0+uTime*2.0))*0.02*(0.3+uLow*0.03*R)*uDistAmt; }
+    else if(uMotion==8){ uv += (noise(uv*14.0+uTime*1.6)-0.5)*0.045*(0.3+uMid*0.03*R)*uDistAmt; }
+    else { uv += (noise(uv*8.0+uTime*1.0)-0.5)*0.03*(0.3+uMid*0.02*R)*uDistAmt; }
+    float aberr=(uBeat*0.01 + uHigh*0.0015) * uReact; vec2 off=vec2(aberr,-aberr);
+    vec4 a0=sampleTex(tex0,uv), aR=sampleTex(tex0,uv+off), aB=sampleTex(tex0,uv-off); vec4 cur=vec4(aR.r,a0.g,aB.b,1.0);
+    vec4 b0=sampleTex(tex1,uv), bR=sampleTex(tex1,uv+off), bB=sampleTex(tex1,uv-off); vec4 nxt=vec4(bR.r,b0.g,bB.b,1.0);
+    vec4 col=mix(cur,nxt,uMix);
+    vec3 hsv=rgb2hsv(col.rgb);
+    float hueShift=(0.35*uHigh*uHueAmt + 0.12*sin(uTime*0.3))*uReact;
+    hsv.x=fract(hsv.x + hueShift);
+    hsv.y=clamp(hsv.y*(1.0+1.2*uMid*uSatAmt*uReact),0.0,1.0);
+    hsv.z=clamp(hsv.z*(0.75+0.9*uVol*uValAmt*uReact),0.0,2.5);
+    vec3 rgb=hsv2rgb(hsv);
+    float vg=smoothstep(0.9,0.25,length(vUv-0.5));
+    rgb += vec3(vg)*(0.22*uHigh*uBloomAmt*uReact + 0.25*uBeat);
+    float g=(noise(vUv*vec2(800.0,600.0)+uTime*60.0)-0.5)*0.04; rgb += g*0.6;
+    gl_FragColor=vec4(rgb,1.0);
+  }
+`;
+
+const uniforms = {
+  tex0:{value:new THREE.Texture()}, tex1:{value:new THREE.Texture()}, uMix:{value:0},
+  uTime:{value:0}, uRes:{value:new THREE.Vector2(innerWidth,innerHeight)},
+  uLow:{value:0}, uMid:{value:0}, uHigh:{value:0}, uVol:{value:0},
+  uMotion:{value:0},
+  uDistAmt:{value:1.2}, uHueAmt:{value:1.4}, uSatAmt:{value:1.2}, uValAmt:{value:1.0}, uBloomAmt:{value:1.2}, uReact:{value:1.6},
+  uBeat:{value:0}
+};
+const material = new THREE.ShaderMaterial({vertexShader, fragmentShader, uniforms});
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), material);
+scene.add(quad);
+
+// ====== Video list ======
+const defaultVideos = [
+  {title:'Forest / Wind', file:'media/forest.mp4'},
+  {title:'Ocean / Waves', file:'media/ocean.mp4'},
+  {title:'Night Sky / Stars', file:'media/stars.mp4'},
+  {title:'Clouds', file:'media/clouds.mp4'},
+  {title:'Mountains', file:'media/mountains.mp4'},
+  {title:'Snow Field', file:'media/snow.mp4'},
+  {title:'Desert', file:'media/desert.mp4'},
+  {title:'Rainy City', file:'media/rain_city.mp4'},
+  {title:'Lake Surface', file:'media/lake.mp4'},
+  {title:'Steam / Geyser', file:'media/steam.mp4'}
+];
+let videos=[...defaultVideos];
+const videoEls=[];
+function makeVideo(src){
+  const v=document.createElement('video');
+  v.src=src; v.crossOrigin='anonymous'; v.loop=true; v.muted=true; v.playsInline=true; v.preload='auto';
+  v.addEventListener('error',()=>showErr('動画を読み込めません: '+src+'（パス/ファイル名を確認）'));
+  return v;
+}
+function ensureVideoEls(){ videoEls.length=0; for(const v of videos) videoEls.push(makeVideo(v.file)); }
+ensureVideoEls();
+
+// ====== Motions ======
+const motions=[
+  {name:'Water Ripple',id:0},{name:'Heat Haze',id:1},{name:'Wind Sway',id:2},{name:'Star Pulse',id:3},{name:'Glacier Crack',id:4},
+  {name:'Desert Shimmer',id:5},{name:'Rain Droplet',id:6},{name:'Lake Ripple',id:7},{name:'Steam Swirl',id:8},{name:'Cloud Drift',id:9}
+];
+
+// ====== UI ======
+const micBtn=document.getElementById('micBtn');
+const sensEl=document.getElementById('sens');
+const smoothEl=document.getElementById('smooth');
+const fftEl=document.getElementById('fft');
+const videoSel=document.getElementById('videoSel');
+const motionSel=document.getElementById('motionSel');
+const autoChk=document.getElementById('auto');
+const kickOnlyChk=document.getElementById('kickOnly');
+const addUrlBtn=document.getElementById('addUrl');
+const addFileBtn=document.getElementById('addFile');
+const filePick=document.getElementById('filePick');
+const fpsEl=document.getElementById('fps');
+const toggleBtn=document.getElementById('toggleHUD');
+const hud=document.getElementById('hud');
+
+const reactAmtEl=document.getElementById('reactAmt');
+const distAmtEl=document.getElementById('distAmt');
+const hueAmtEl=document.getElementById('hueAmt');
+const satAmtEl=document.getElementById('satAmt');
+const valAmtEl=document.getElementById('valAmt');
+const bloomAmtEl=document.getElementById('bloomAmt');
+
+function populateSelects(){
+  videoSel.innerHTML=''; videos.forEach((v,i)=>{ const o=document.createElement('option'); o.value=i; o.textContent=`${i+1}. ${v.title}`; videoSel.appendChild(o); });
+  motionSel.innerHTML=''; motions.forEach((m,i)=>{ const o=document.createElement('option'); o.value=m.id; o.textContent=`${i+1}. ${m.name}`; motionSel.appendChild(o); });
+  videoSel.value='0'; motionSel.value='0';
+}
+populateSelects();
+
+// ====== Playback / Fade ======
+let curVideo=0, nextVideo=1, fading=false, fadeT=0; const FADE_DUR=0.9;
+function setTextures(i,j){
+  const vi=videoEls[i], vj=videoEls[j];
+  if(!vi || !vj){ showErr('テクスチャ設定に失敗（動画が見つかりません）'); return; }
+  uniforms.tex0.value=new THREE.VideoTexture(vi);
+  uniforms.tex1.value=new THREE.VideoTexture(vj);
+  uniforms.tex0.value.minFilter=uniforms.tex0.value.magFilter=THREE.LinearFilter;
+  uniforms.tex1.value.minFilter=uniforms.tex1.value.magFilter=THREE.LinearFilter;
+}
+function playIndex(i){ const v=videoEls[i]; if(!v){ showErr('動画インデックスが不正です'); return; } v.currentTime=0; v.play().catch(()=>{}); }
+function startVideo(i){ curVideo=i; nextVideo=(i+1)%videos.length; playIndex(curVideo); playIndex(nextVideo); setTextures(curVideo,nextVideo); }
+startVideo(0);
+function crossfadeToVideo(i){ if(i===curVideo||fading) return; nextVideo=i; playIndex(nextVideo); setTextures(curVideo,nextVideo); fading=true; fadeT=0; }
+
+// ====== Motion set ======
+function setMotion(id){ uniforms.uMotion.value=id; }
+videoSel.addEventListener('change', ()=>{ const i=parseInt(videoSel.value,10)||0; crossfadeToVideo(i); });
+motionSel.addEventListener('change', ()=>{ setMotion(parseInt(motionSel.value,10)||0); });
+
+addUrlBtn.addEventListener('click', ()=>{ const url=prompt('動画URL（mp4/webm, CORS許可が必要）'); if(!url) return; const title=prompt('シーン名','Custom')||'Custom'; videos.push({title,file:url}); videoEls.push(makeVideo(url)); populateSelects(); });
+addFileBtn.addEventListener('click', ()=> filePick.click());
+filePick.addEventListener('change', ()=>{ const f=filePick.files[0]; if(!f) return; const url=URL.createObjectURL(f); videos.push({title:f.name,file:url}); videoEls.push(makeVideo(url)); populateSelects(); });
+
+// ====== Audio ======
+let actx, analyser, freq, time; let started=false; let sampleRate=48000; let energyEMA=0, emaAlpha=0.12, lastBeat=0; const MIN_BEAT_GAP=0.16; let lastTs=performance.now();
+let beatEnv=0;
+function hzToBin(hz){ return Math.round(hz * analyser.fftSize / sampleRate); }
+function bandEnergy(f,a,b){ const s=Math.max(0,hzToBin(a)); const e=Math.min(f.length-1,hzToBin(b)); let sum=0; for(let i=s;i<=e;i++) sum+=f[i]; return sum/Math.max(1,(e-s+1)); }
+function detectBeat(){
+  const low=bandEnergy(freq,20,180), mid=bandEnergy(freq,180,2000), high=bandEnergy(freq,2000,9000);
+  const overall=(low*1.8 + mid*1.2 + high*0.9)/3.9;
+  const sens=parseFloat(sensEl.value);
+  energyEMA = energyEMA===0? overall : energyEMA*(1-emaAlpha)+overall*emaAlpha;
+  const now=performance.now()/1000;
+  const isBeat = overall > energyEMA*(1+sens) && (now-lastBeat) > MIN_BEAT_GAP;
+  const kickBeat = low > energyEMA*(1+sens*0.75);
+  if(isBeat){ lastBeat=now; beatEnv=1.0; }
+  return {isBeat,kickBeat,low,mid,high,overall};
+}
+async function start(){
+  if(started){ stop(); return; }
+  try{
+    actx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'}); sampleRate=actx.sampleRate;
+    analyser=actx.createAnalyser(); analyser.fftSize=parseInt(fftEl.value,10); analyser.smoothingTimeConstant=parseFloat(smoothEl.value);
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+    const src=actx.createMediaStreamSource(stream); src.connect(analyser);
+    freq=new Uint8Array(analyser.frequencyBinCount); time=new Uint8Array(analyser.fftSize); started=true; micBtn.textContent='⏹ 停止';
+  }catch(err){ showErr('マイク権限エラー: '+err.name+' '+err.message); }
+}
+function stop(){ started=false; micBtn.textContent='🎤 マイク開始'; if(actx) actx.close(); }
+micBtn.addEventListener('click', start);
+fftEl.addEventListener('input', ()=>{ if(analyser){ analyser.fftSize=parseInt(fftEl.value,10); freq=new Uint8Array(analyser.frequencyBinCount); time=new Uint8Array(analyser.fftSize);} });
+smoothEl.addEventListener('input', ()=>{ if(analyser) analyser.smoothingTimeConstant=parseFloat(smoothEl.value); });
+
+let autoSwitch=true; autoChk.addEventListener('change', ()=> autoSwitch=autoChk.checked);
+
+// ====== Loop ======
+function loop(){
+  requestAnimationFrame(loop);
+  const now=performance.now(); const dt=Math.max(0,(now-lastTs)/1000); lastTs=now;
+  uniforms.uTime.value+=dt; uniforms.uRes.value.set(innerWidth,innerHeight);
+
+  uniforms.uReact.value = parseFloat(reactAmtEl.value);
+  uniforms.uDistAmt.value = parseFloat(distAmtEl.value);
+  uniforms.uHueAmt.value  = parseFloat(hueAmtEl.value);
+  uniforms.uSatAmt.value  = parseFloat(satAmtEl.value);
+  uniforms.uValAmt.value  = parseFloat(valAmtEl.value);
+  uniforms.uBloomAmt.value= parseFloat(bloomAmtEl.value);
+
+  beatEnv = Math.max(0, beatEnv - dt*3.0);
+  uniforms.uBeat.value = beatEnv;
+
+  if(analyser){
+    analyser.getByteFrequencyData(freq); analyser.getByteTimeDomainData(time);
+    const info=detectBeat();
+    uniforms.uLow.value=info.low/255; uniforms.uMid.value=info.mid/255; uniforms.uHigh.value=info.high/255; uniforms.uVol.value=info.overall/255;
+    if(autoSwitch && info.isBeat && (!kickOnlyChk.checked || info.kickBeat)){
+      const nx=(curVideo+1)%videos.length; crossfadeToVideo(nx); videoSel.value=String(nx);
+    }
+  }
+
+  if(fading){
+    fadeT+=dt; uniforms.uMix.value=Math.min(1, fadeT/FADE_DUR);
+    if(uniforms.uMix.value>=1){ curVideo=nextVideo; fading=false; uniforms.uMix.value=0; setTextures(curVideo,(curVideo+1)%videos.length); }
+  }
+  if(renderer) renderer.render(scene,camera);
+}
+loop();
+
+// iOS対策
+addEventListener('pointerdown', ()=>{ for(const v of videoEls){ v.play().catch(()=>{}); } }, {once:true});
+
+// keyboard
+addEventListener('keydown',(e)=>{
+  if(e.key===' '){
+    e.prevent止; autoChk.checked=false; autoSwitch=false;
+    const nx=(curVideo+1)%videos.length; crossfadeToVideo(nx); videoSel.value=String(nx);
+  }
+  if(e.key.toLowerCase()==='h'){ toggleHUD(); }
+});
+
+// FPS
+let lt=performance.now(), frames=0; setInterval(()=>{ const n=performance.now(); frames++; if(n-lt>1000){ fpsEl.textContent='FPS: '+frames; frames=0; lt=n; } }, 200);
+
+// HUD toggle (FIX: 重複定義しない)
+function toggleHUD(){
+  hud.classList.toggle('hidden');
+  toggleBtn.textContent = hud.classList.contains('hidden')? '⚙️ パネル表示' : '⚙️ パネル非表示';
+}
+toggleBtn.addEventListener('click', toggleHUD);
+</script>
+</body>
+</html>
